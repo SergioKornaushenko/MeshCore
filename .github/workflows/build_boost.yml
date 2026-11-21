@@ -1,0 +1,153 @@
+name: Build ProMicro Repeater (Boost P1.06)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout MeshCore v1.18.0
+        uses: actions/checkout@v4
+        with:
+          ref: v1.18.0
+
+      - name: Install PlatformIO
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install platformio
+
+      - name: Apply P1.06 Boost Patch
+        run: |
+          python3 - << 'EOF'
+          import pathlib, re, sys
+
+          def patch_file(path, old, new, label):
+              p = pathlib.Path(path)
+              if not p.exists():
+                  print(f"ERROR: File not found: {path}")
+                  sys.exit(1)
+              text = p.read_text(encoding="utf-8")
+              if old not in text:
+                  print(f"ERROR: Anchor not found in {path} ({label})")
+                  sys.exit(1)
+              p.write_text(text.replace(old, new, 1), encoding="utf-8")
+              print(f"OK: Patched {path} ({label})")
+
+          # 1. Глобальный хелпер для P1.06
+          boost_hdr = pathlib.Path("src/helpers/BoostPin.h")
+          boost_hdr.write_text("""#pragma once
+          #include <Arduino.h>
+          #ifdef NRF52_SERIES
+          #include <hal/nrf_gpio.h>
+          #define BOOST_PIN NRF_GPIO_PIN_MAP(1, 6)
+          inline void boost_init() { nrf_gpio_cfg_output(BOOST_PIN); nrf_gpio_pin_clear(BOOST_PIN); }
+          inline void boost_on()   { nrf_gpio_pin_set(BOOST_PIN); }
+          inline void boost_off()  { nrf_gpio_pin_clear(BOOST_PIN); }
+          #else
+          inline void boost_init() {}
+          inline void boost_on()   {}
+          inline void boost_off()  {}
+          #endif
+          extern uint8_t g_boost_ms;
+          """, encoding="utf-8")
+          print("OK: Created src/helpers/BoostPin.h")
+
+          # 2. Добавляем boost_ms в NodePrefs (CommonCLI.h)
+          cli_h = pathlib.Path("src/helpers/CommonCLI.h")
+          text = cli_h.read_text(encoding="utf-8")
+          if "uint8_t boost_ms;" not in text:
+              m = re.search(r"(struct\s+NodePrefs\s*\{[\s\S]*?)(\n\};)", text)
+              if not m:
+                  print("ERROR: NodePrefs struct not found in CommonCLI.h")
+                  sys.exit(1)
+              new_text = text[:m.start(2)] + "\n  uint8_t boost_ms;" + text[m.start(2):]
+              cli_h.write_text(new_text, encoding="utf-8")
+              print("OK: Added boost_ms to NodePrefs")
+
+          # 3. Добавляем команды get boost / set boost в CommonCLI.cpp
+          cli_cpp = pathlib.Path("src/helpers/CommonCLI.cpp")
+          text = cli_cpp.read_text(encoding="utf-8")
+          text = '#include "BoostPin.h"\nuint8_t g_boost_ms = 0;\n' + text
+
+          # Вставка в блок get
+          get_anchor = 'strcmp(config, "txdelay") == 0'
+          get_patch = '''strcmp(config, "boost") == 0) {
+              sprintf(reply, "> %u", (unsigned)_prefs->boost_ms);
+            } else if (strcmp(config, "txdelay") == 0'''
+          if get_anchor not in text:
+              print("ERROR: get txdelay anchor not found in CommonCLI.cpp")
+              sys.exit(1)
+          text = text.replace(get_anchor, get_patch, 1)
+
+          # Вставка в блок set (второе вхождение txdelay)
+          idx = text.find(get_anchor, text.find(get_anchor) + 1)
+          if idx == -1:
+              print("ERROR: set txdelay anchor not found in CommonCLI.cpp")
+              sys.exit(1)
+          set_patch = '''strcmp(config, "boost") == 0) {
+              int val = atoi(value);
+              if (val < 0 || val > 100) {
+                strcpy(reply, "Error: range 0..100");
+              } else {
+                _prefs->boost_ms = (uint8_t)val;
+                g_boost_ms = _prefs->boost_ms;
+                savePrefs();
+                if (g_boost_ms == 100) boost_on(); else boost_off();
+                strcpy(reply, "OK");
+              }
+            } else if (strcmp(config, "txdelay") == 0'''
+          text = text[:idx] + set_patch + text[idx + len(get_anchor):]
+          cli_cpp.write_text(text, encoding="utf-8")
+          print("OK: Patched CommonCLI.cpp")
+
+          # 4. Управление пином при TX в RadioLibWrappers.cpp
+          rl_cpp = pathlib.Path("src/helpers/radiolib/RadioLibWrappers.cpp")
+          text = rl_cpp.read_text(encoding="utf-8")
+          text = '#include "../BoostPin.h"\n' + text
+
+          # Перед передачей
+          tx_m = re.search(r"(startSendRaw\s*\([^\)]*\)\s*\{)", text)
+          if not tx_m:
+              print("ERROR: startSendRaw not found in RadioLibWrappers.cpp")
+              sys.exit(1)
+          tx_inject = """
+            if (g_boost_ms == 100) {
+              boost_on();
+            } else if (g_boost_ms > 0) {
+              boost_on();
+              delay(g_boost_ms);
+            }
+          """
+          text = text[:tx_m.end()] + tx_inject + text[tx_m.end():]
+
+          # После завершения передачи
+          fin_m = re.search(r"(finishSend\s*\([^\)]*\)\s*\{)", text)
+          if fin_m:
+              text = text[:fin_m.end()] + "\n  if (g_boost_ms < 100) boost_off();\n" + text[fin_m.end():]
+          else:
+              print("WARNING: finishSend not found, check TX off hook")
+
+          rl_cpp.write_text(text, encoding="utf-8")
+          print("OK: Patched RadioLibWrappers.cpp")
+
+          # 5. Инициализация пина в simple_repeater/main.cpp
+          main_cpp = pathlib.Path("examples/simple_repeater/main.cpp")
+          if main_cpp.exists():
+              m_text = main_cpp.read_text(encoding="utf-8")
+              m_text = '#include <helpers/BoostPin.h>\n' + m_text
+              setup_m = re.search(r"(void\s+setup\s*\(\s*\)\s*\{)", m_text)
+              if setup_m:
+                  m_text = m_text[:setup_m.end()] + "\n  boost_init();\n" + m_text[setup_m.end():]
+              main_cpp.write_text(m_text, encoding="utf-8")
+              print("OK: Patched examples/simple_repeater/main.cpp")
+          EOF
+
+      - name: Build ProMicro_repeater UF2
+        run: pio run -e ProMicro_repeater
+
+      - name: Upload UF2 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProMicro_repeater_boost_uf2
+          path: .pio/build/ProMicro_repeater/firmware.uf2
